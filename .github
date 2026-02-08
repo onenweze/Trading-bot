@@ -1,0 +1,395 @@
+//@version=5
+strategy("MTF Trading Bot Pro - Automated", 
+         shorttitle="MTF-BOT", 
+         overlay=true, 
+         max_labels_count=500, 
+         max_lines_count=500,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         initial_capital=10000,
+         commission_type=strategy.commission.percent,
+         commission_value=0.1)
+
+// ═══════════════════════════════════════════════════════════════════
+// 📌 TRADING CONFIGURATION INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+// Timeframes for analysis
+tf1 = input.timeframe("15", "Timeframe 1", group="Multi-Timeframe")
+tf2 = input.timeframe("30", "Timeframe 2", group="Multi-Timeframe")
+tf3 = input.timeframe("60", "Timeframe 3", group="Multi-Timeframe")
+
+// Weights for each timeframe
+weight1 = input.float(1.0, "Weight TF1", minval=0.1, maxval=3.0, step=0.1, group="Multi-Timeframe")
+weight2 = input.float(1.5, "Weight TF2", minval=0.1, maxval=3.0, step=0.1, group="Multi-Timeframe")
+weight3 = input.float(2.0, "Weight TF3", minval=0.1, maxval=3.0, step=0.1, group="Multi-Timeframe")
+
+// Analysis parameters
+trend_length = input.int(50, "Trend Period", minval=10, maxval=200, group="Analysis")
+signal_sensitivity = input.float(60, "Signal Sensitivity (%)", minval=30, maxval=100, step=5, group="Analysis")
+projection_bars = input.int(20, "Projection Bars", minval=5, maxval=100, group="Analysis")
+
+// Trading parameters
+risk_percentage = input.float(2.0, "Risk % per Trade", minval=0.5, maxval=10.0, step=0.5, group="Trading")
+reward_risk_ratio = input.float(2.0, "Reward/Risk Ratio", minval=1.0, maxval=5.0, step=0.5, group="Trading")
+max_trades_per_day = input.int(5, "Max Trades Per Day", minval=1, maxval=20, group="Trading")
+use_trailing_stop = input.bool(true, "Use Trailing Stop", group="Trading")
+trailing_stop_percent = input.float(1.5, "Trailing Stop %", minval=0.5, maxval=5.0, step=0.1, group="Trading")
+
+// Advanced optimizations
+adaptive_mode = input.bool(true, "Adaptive Mode", group="Optimizations")
+noise_filter = input.bool(true, "Noise Filter", group="Optimizations")
+use_martingale = input.bool(false, "Use Martingale (⚠️ High Risk)", group="Optimizations")
+martingale_multiplier = input.float(1.5, "Martingale Multiplier", minval=1.1, maxval=3.0, group="Optimizations")
+
+// Visualization
+show_projection = input.bool(true, "Show Projection", group="Visualization")
+show_trendline = input.bool(true, "Show Trend Line", group="Visualization")
+show_signals = input.bool(true, "Show Signals", group="Visualization")
+show_strength = input.bool(true, "Show Signal Strength", group="Visualization")
+show_trading_levels = input.bool(true, "Show Trading Levels", group="Visualization")
+
+// ═══════════════════════════════════════════════════════════════════
+// 🧮 ADVANCED FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════
+
+// Function: Calculate adaptive trend
+f_adaptive_trend(src, len) =>
+    volatility = ta.atr(14) / ta.sma(ta.atr(14), 50)
+    adaptive_len = adaptive_mode ? math.round(len * (1 + volatility * 0.3)) : len
+    adaptive_len := math.max(10, math.min(adaptive_len, 200))
+    
+    ema_fast = ta.ema(src, math.round(adaptive_len * 0.4))
+    ema_slow = ta.ema(src, adaptive_len)
+    
+    trend_direction = ema_fast > ema_slow ? 1 : -1
+    trend_strength = math.abs(ema_fast - ema_slow) / ta.atr(20) * 100
+    
+    [trend_direction, trend_strength, ema_fast, ema_slow]
+
+// Function: Detect market regime
+f_market_regime() =>
+    adr_current = ta.atr(20)
+    adr_avg = ta.sma(ta.atr(20), 50)
+    volatility_ratio = adr_current / adr_avg
+    
+    regime = volatility_ratio > 1.2 ? "high_vol" : 
+             volatility_ratio < 0.8 ? "low_vol" : "normal"
+    
+    regime
+
+// Function: Intelligent noise filter
+f_noise_filter(signal_raw, strength) =>
+    if not noise_filter
+        true
+    else
+        market_noise = ta.atr(5) / ta.atr(20)
+        regime = f_market_regime()
+        
+        threshold = regime == "high_vol" ? 0.7 : 
+                   regime == "low_vol" ? 0.4 : 0.5
+        
+        strength > threshold and market_noise < 1.5
+
+// Function: Trend line with linear regression
+f_trendline(src, len) =>
+    sum_x = 0.0
+    sum_y = 0.0
+    sum_xy = 0.0
+    sum_xx = 0.0
+    
+    for i = 0 to len - 1
+        x = float(i)
+        y = src[len - 1 - i]
+        sum_x := sum_x + x
+        sum_y := sum_y + y
+        sum_xy := sum_xy + x * y
+        sum_xx := sum_xx + x * x
+    
+    n = float(len)
+    slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
+    intercept = (sum_y - slope * sum_x) / n
+    
+    current_value = slope * (len - 1) + intercept
+    projected_value = slope * (len - 1 + projection_bars) + intercept
+    
+    [slope, current_value, projected_value]
+
+// Function: Calculate position size
+f_calculate_position_size(entry_price, stop_loss) =>
+    account_balance = strategy.equity
+    risk_amount = account_balance * (risk_percentage / 100)
+    price_difference = math.abs(entry_price - stop_loss)
+    
+    if price_difference > 0
+        position_size = risk_amount / price_difference
+    else
+        position_size = 0
+    
+    position_size
+
+// Function: Count trades today
+f_count_trades_today() =>
+    trade_count = 0
+    for i = 0 to bar_index
+        if strategy.trades.size(i) > 0
+            trade_count += 1
+    trade_count
+
+// ═══════════════════════════════════════════════════════════════════
+// 📊 MULTI-TIMEFRAME ANALYSIS
+// ═══════════════════════════════════════════════════════════════════
+
+// TF1 Analysis
+[trend_dir1, trend_str1, ema_f1, ema_s1] = request.security(syminfo.tickerid, tf1, f_adaptive_trend(close, trend_length))
+rsi1 = request.security(syminfo.tickerid, tf1, ta.rsi(close, 14))
+volume_trend1 = request.security(syminfo.tickerid, tf1, ta.sma(volume, 20))
+volume_current1 = request.security(syminfo.tickerid, tf1, volume)
+
+bullish1 = trend_dir1 > 0 and rsi1 > 50 and volume_current1 > volume_trend1
+bearish1 = trend_dir1 < 0 and rsi1 < 50 and volume_current1 > volume_trend1
+
+// TF2 Analysis
+[trend_dir2, trend_str2, ema_f2, ema_s2] = request.security(syminfo.tickerid, tf2, f_adaptive_trend(close, trend_length))
+rsi2 = request.security(syminfo.tickerid, tf2, ta.rsi(close, 14))
+volume_trend2 = request.security(syminfo.tickerid, tf2, ta.sma(volume, 20))
+volume_current2 = request.security(syminfo.tickerid, tf2, volume)
+
+bullish2 = trend_dir2 > 0 and rsi2 > 50 and volume_current2 > volume_trend2
+bearish2 = trend_dir2 < 0 and rsi2 < 50 and volume_current2 > volume_trend2
+
+// TF3 Analysis
+[trend_dir3, trend_str3, ema_f3, ema_s3] = request.security(syminfo.tickerid, tf3, f_adaptive_trend(close, trend_length))
+rsi3 = request.security(syminfo.tickerid, tf3, ta.rsi(close, 14))
+volume_trend3 = request.security(syminfo.tickerid, tf3, ta.sma(volume, 20))
+volume_current3 = request.security(syminfo.tickerid, tf3, volume)
+
+bullish3 = trend_dir3 > 0 and rsi3 > 50 and volume_current3 > volume_trend3
+bearish3 = trend_dir3 < 0 and rsi3 < 50 and volume_current3 > volume_trend3
+
+// ══════════════════════════���════════════════════════════════════════
+// 🎯 WEIGHTED VOTING SYSTEM
+// ═══════════════════════════════════════════════════════════════════
+
+total_weight = weight1 + weight2 + weight3
+
+bullish_score = (bullish1 ? weight1 : 0) + (bullish2 ? weight2 : 0) + (bullish3 ? weight3 : 0)
+bearish_score = (bearish1 ? weight1 : 0) + (bearish2 ? weight2 : 0) + (bearish3 ? weight3 : 0)
+
+bullish_percentage = (bullish_score / total_weight) * 100
+bearish_percentage = (bearish_score / total_weight) * 100
+
+avg_strength = (trend_str1 * weight1 + trend_str2 * weight2 + trend_str3 * weight3) / total_weight
+
+// ═══════════════════════════════════════════════════════════════════
+// 🚦 SIGNAL GENERATION
+// ═══════════════════════════════════════════════════════════════════
+
+buy_signal_raw = bullish_percentage >= signal_sensitivity and avg_strength > 0.5
+buy_signal = buy_signal_raw and f_noise_filter(buy_signal_raw, avg_strength)
+buy_signal_confirmed = buy_signal and not buy_signal[1]
+
+sell_signal_raw = bearish_percentage >= signal_sensitivity and avg_strength > 0.5
+sell_signal = sell_signal_raw and f_noise_filter(sell_signal_raw, avg_strength)
+sell_signal_confirmed = sell_signal and not sell_signal[1]
+
+// ═══════════════════════════════════════════════════════════════════
+// 📈 TREND LINE AND PROJECTION
+// ═══════════════════════════════════════════════════════════════════
+
+[slope, trendline_current, trendline_projected] = f_trendline(close, trend_length)
+
+atr_value = ta.atr(14)
+projection_multiplier = adaptive_mode ? (1 + ta.atr(14) / ta.sma(ta.atr(14), 50)) : 1.5
+
+// Trading levels
+entry_price = close
+
+// For BUY orders
+target_buy = close + (atr_value * projection_multiplier * reward_risk_ratio)
+stop_buy = close - (atr_value * projection_multiplier)
+
+// For SELL orders
+target_sell = close - (atr_value * projection_multiplier * reward_risk_ratio)
+stop_sell = close + (atr_value * projection_multiplier)
+
+// ═════════════════════════════════════════════════════════════════���═
+// 💰 TRADING LOGIC & EXECUTION
+// ═══════════════════════════════════════════════════════════════════
+
+// Check if we can trade today
+trades_today = 0
+if barstate.islast
+    for i = 0 to bar_index
+        if time[i] >= (time - 86400000)  // Last 24 hours
+            trades_today += 1
+
+can_trade = trades_today < max_trades_per_day
+
+// Trading conditions
+in_long_position = strategy.position_size > 0
+in_short_position = strategy.position_size < 0
+
+// BUY EXECUTION
+if buy_signal_confirmed and can_trade and not in_long_position and not in_short_position
+    position_size = f_calculate_position_size(entry_price, stop_buy)
+    
+    if position_size > 0
+        strategy.entry("BUY", strategy.long, qty=position_size)
+        strategy.exit("BUY_EXIT", from_entry="BUY", 
+                     limit=target_buy, 
+                     stop=stop_buy,
+                     comment="Buy TP/SL")
+
+// SELL EXECUTION
+if sell_signal_confirmed and can_trade and not in_long_position and not in_short_position
+    position_size = f_calculate_position_size(entry_price, stop_sell)
+    
+    if position_size > 0
+        strategy.entry("SELL", strategy.short, qty=position_size)
+        strategy.exit("SELL_EXIT", from_entry="SELL", 
+                     limit=target_sell, 
+                     stop=stop_sell,
+                     comment="Sell TP/SL")
+
+// TRAILING STOP LOGIC
+if use_trailing_stop and strategy.position_size != 0
+    trailing_stop_level = close * (1 - (trailing_stop_percent / 100))
+    
+    if strategy.position_size > 0
+        strategy.exit("TRAILING_STOP_LONG", stop=trailing_stop_level)
+    else if strategy.position_size < 0
+        trailing_stop_level = close * (1 + (trailing_stop_percent / 100))
+        strategy.exit("TRAILING_STOP_SHORT", stop=trailing_stop_level)
+
+// ═══════════════════════════════════════════════════════════════════
+// 🎨 VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════
+
+// Trend line
+plot(show_trendline ? trendline_current : na, "Trend Line", 
+     color=slope > 0 ? color.new(color.green, 30) : color.new(color.red, 30), 
+     linewidth=2, style=plot.style_line)
+
+// EMAs
+[trend_dir_current, trend_str_current, ema_f_current, ema_s_current] = f_adaptive_trend(close, trend_length)
+plot(ema_f_current, "Fast EMA", color=color.new(color.blue, 50), linewidth=1)
+plot(ema_s_current, "Slow EMA", color=color.new(color.orange, 50), linewidth=1)
+
+// Background
+bgcolor(buy_signal ? color.new(color.green, 90) : 
+        sell_signal ? color.new(color.red, 90) : na)
+
+// Trading levels visualization
+if show_trading_levels and (buy_signal_confirmed or sell_signal_confirmed)
+    if buy_signal_confirmed
+        line.new(bar_index, entry_price, bar_index + projection_bars, target_buy, 
+                 color=color.new(color.green, 50), width=2, style=line.style_dashed, 
+                 xloc=xloc.bar_index, extend=extend.right)
+        line.new(bar_index, entry_price, bar_index + projection_bars, stop_buy, 
+                 color=color.new(color.red, 50), width=2, style=line.style_dotted, 
+                 xloc=xloc.bar_index, extend=extend.right)
+    
+    if sell_signal_confirmed
+        line.new(bar_index, entry_price, bar_index + projection_bars, target_sell, 
+                 color=color.new(color.red, 50), width=2, style=line.style_dashed, 
+                 xloc=xloc.bar_index, extend=extend.right)
+        line.new(bar_index, entry_price, bar_index + projection_bars, stop_sell, 
+                 color=color.new(color.green, 50), width=2, style=line.style_dotted, 
+                 xloc=xloc.bar_index, extend=extend.right)
+
+// Trade entry markers
+if show_signals and buy_signal_confirmed
+    label.new(bar_index, low, 
+              text="🔵 BUY\n" + str.tostring(math.round(bullish_percentage)) + "%\nSL: " + str.tostring(math.round(stop_buy, 2)), 
+              style=label.style_label_up, 
+              color=color.new(color.green, 0), 
+              textcolor=color.white, 
+              size=size.small)
+
+if show_signals and sell_signal_confirmed
+    label.new(bar_index, high, 
+              text="🔴 SELL\n" + str.tostring(math.round(bearish_percentage)) + "%\nSL: " + str.tostring(math.round(stop_sell, 2)), 
+              style=label.style_label_down, 
+              color=color.new(color.red, 0), 
+              textcolor=color.white, 
+              size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════
+// 📊 INFO PANEL
+// ═══════════════════════════════════════════════════════════════════
+
+var table info_table = table.new(position.top_right, 2, 10, 
+                                  bgcolor=color.new(color.black, 85), 
+                                  frame_color=color.gray, 
+                                  frame_width=1)
+
+if barstate.islast and show_strength
+    table.cell(info_table, 0, 0, "BOT STATUS", 
+               text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    table.cell(info_table, 1, 0, "INFO", 
+               text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 70))
+    
+    table.cell(info_table, 0, 1, tf1, text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 1, bullish1 ? "🟢 BULL" : bearish1 ? "🔴 BEAR" : "⚪ NEUTRAL", 
+               text_color=bullish1 ? color.lime : bearish1 ? color.red : color.gray, 
+               text_size=size.small)
+    
+    table.cell(info_table, 0, 2, tf2, text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 2, bullish2 ? "🟢 BULL" : bearish2 ? "🔴 BEAR" : "⚪ NEUTRAL", 
+               text_color=bullish2 ? color.lime : bearish2 ? color.red : color.gray, 
+               text_size=size.small)
+    
+    table.cell(info_table, 0, 3, tf3, text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 1, 3, bullish3 ? "🟢 BULL" : bearish3 ? "🔴 BEAR" : "⚪ NEUTRAL", 
+               text_color=bullish3 ? color.lime : bearish3 ? color.red : color.gray, 
+               text_size=size.small)
+    
+    table.cell(info_table, 0, 4, "CONSENSUS", text_color=color.white, text_size=size.small)
+    consensus_text = bullish_percentage >= signal_sensitivity ? "🟢 BUY " + str.tostring(math.round(bullish_percentage)) + "%" :
+                     bearish_percentage >= signal_sensitivity ? "🔴 SELL " + str.tostring(math.round(bearish_percentage)) + "%" :
+                     "⚪ WAIT"
+    table.cell(info_table, 1, 4, consensus_text, 
+               text_color=bullish_percentage >= signal_sensitivity ? color.lime : 
+                         bearish_percentage >= signal_sensitivity ? color.red : color.gray, 
+               text_size=size.small)
+    
+    table.cell(info_table, 0, 5, "STRENGTH", text_color=color.white, text_size=size.small)
+    strength_color = avg_strength > 1.5 ? color.lime : avg_strength > 0.8 ? color.yellow : color.orange
+    table.cell(info_table, 1, 5, str.tostring(math.round(avg_strength * 100)) + "%", 
+               text_color=strength_color, text_size=size.small)
+    
+    regime = f_market_regime()
+    table.cell(info_table, 0, 6, "REGIME", text_color=color.white, text_size=size.small)
+    regime_text = regime == "high_vol" ? "⚡ HIGH VOL" : 
+                  regime == "low_vol" ? "💤 LOW VOL" : "📊 NORMAL"
+    table.cell(info_table, 1, 6, regime_text, text_color=color.gray, text_size=size.small)
+    
+    table.cell(info_table, 0, 7, "POSITION", text_color=color.white, text_size=size.small)
+    position_text = in_long_position ? "📈 LONG" : in_short_position ? "📉 SHORT" : "⚪ NEUTRAL"
+    table.cell(info_table, 1, 7, position_text, 
+               text_color=in_long_position ? color.lime : in_short_position ? color.red : color.gray, 
+               text_size=size.small)
+    
+    table.cell(info_table, 0, 8, "TRADES TODAY", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 8, str.tostring(trades_today) + "/" + str.tostring(max_trades_per_day), 
+               text_color=color.orange, text_size=size.small)
+    
+    table.cell(info_table, 0, 9, "EQUITY", text_color=color.white, text_size=size.small)
+    equity_text = "$" + str.tostring(math.round(strategy.equity, 2))
+    table.cell(info_table, 1, 9, equity_text, text_color=color.cyan, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔔 ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+if buy_signal_confirmed
+    alert("🔵 BUY Signal - Consensus: " + str.tostring(math.round(bullish_percentage)) + "% - Entry: " + str.tostring(math.round(entry_price, 2)) + " - SL: " + str.tostring(math.round(stop_buy, 2)) + " - TP: " + str.tostring(math.round(target_buy, 2)), alert.freq_once_per_bar_close)
+
+if sell_signal_confirmed
+    alert("🔴 SELL Signal - Consensus: " + str.tostring(math.round(bearish_percentage)) + "% - Entry: " + str.tostring(math.round(entry_price, 2)) + " - SL: " + str.tostring(math.round(stop_sell, 2)) + " - TP: " + str.tostring(math.round(target_sell, 2)), alert.freq_once_per_bar_close)
+
+// Invisible plots for strategy stats
+plot(bullish_percentage, "Bullish %", display=display.none)
+plot(bearish_percentage, "Bearish %", display=display.none)
+plot(avg_strength, "Avg Strength", display=display.none)
